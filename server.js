@@ -20,7 +20,7 @@ let tokenCache = {
 async function getAdminAccessToken() {
   const now = Date.now();
 
-  if (tokenCache.accessToken && now < tokenCache.expiresAt - 60_000) {
+  if (tokenCache.accessToken && now < tokenCache.expiresAt - 60000) {
     return tokenCache.accessToken;
   }
 
