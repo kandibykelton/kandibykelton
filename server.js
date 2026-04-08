@@ -16,6 +16,7 @@ const {
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
 app.use('/webhooks/refunds-create', express.raw({ type: '*/*' }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 let tokenCache = {
   accessToken: null,
@@ -61,13 +62,50 @@ function verifyShopifyWebhook(req) {
     .digest('base64');
 
   try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+  } catch {
+    return false;
+  }
+}
+
+function verifyAppProxySignature(query) {
+  const providedSignature = query.signature;
+  if (!providedSignature) return false;
+
+  const cloned = { ...query };
+  delete cloned.signature;
+
+  const sorted = Object.keys(cloned)
+    .sort()
+    .map((key) => {
+      const value = cloned[key];
+      if (Array.isArray(value)) {
+        return `${key}=${value.join(',')}`;
+      }
+      return `${key}=${value ?? ''}`;
+    })
+    .join('');
+
+  const digest = crypto
+    .createHmac('sha256', SHOPIFY_CLIENT_SECRET)
+    .update(sorted)
+    .digest('hex');
+
+  try {
     return crypto.timingSafeEqual(
       Buffer.from(digest),
-      Buffer.from(hmacHeader)
+      Buffer.from(providedSignature)
     );
   } catch {
     return false;
   }
+}
+
+function isFreshProxyRequest(timestamp) {
+  const ts = Number(timestamp);
+  if (!ts) return false;
+  const now = Math.floor(Date.now() / 1000);
+  return Math.abs(now - ts) <= 300;
 }
 
 async function getAdminAccessToken() {
@@ -303,6 +341,56 @@ function getRefundAmount(refund) {
   return total;
 }
 
+async function redeemForCustomer(customerGid, rewardKey) {
+  const tier = REWARD_TIERS[String(rewardKey)];
+  if (!tier) {
+    return {
+      status: 400,
+      body: {
+        error: 'Invalid reward',
+        validRewards: Object.keys(REWARD_TIERS),
+      },
+    };
+  }
+
+  const current = await getCustomerPoints(customerGid);
+
+  if (current.balance < tier.points) {
+    return {
+      status: 400,
+      body: {
+        error: 'Not enough PLUR Points',
+        currentBalance: current.balance,
+        requiredPoints: tier.points,
+      },
+    };
+  }
+
+  const newBalance = current.balance - tier.points;
+  const newEarned = current.earned;
+  const newRedeemed = current.redeemed + tier.points;
+  const newTier = getTierName(newBalance);
+
+  const creditTx = await creditStoreCreditToCustomer(customerGid, tier.credit, 'USD');
+  await setCustomerPoints(customerGid, newBalance, newEarned, newRedeemed, newTier);
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      customerId: customerGid,
+      customerName: current.name,
+      reward: tier,
+      oldBalance: current.balance,
+      newBalance,
+      oldRedeemed: current.redeemed,
+      newRedeemed,
+      newTier,
+      storeCreditTransaction: creditTx,
+    },
+  };
+}
+
 app.get('/health', (req, res) => {
   res.status(200).send('ok');
 });
@@ -328,6 +416,7 @@ app.get('/token-test', async (req, res) => {
   }
 });
 
+// keep for backup testing only
 app.get('/redeem-test', async (req, res) => {
   try {
     const { key, customerId, reward } = req.query;
@@ -340,46 +429,49 @@ app.get('/redeem-test', async (req, res) => {
       return res.status(400).json({ error: 'Missing customerId' });
     }
 
-    const tier = REWARD_TIERS[String(reward)];
-    if (!tier) {
-      return res.status(400).json({
-        error: 'Invalid reward',
-        validRewards: Object.keys(REWARD_TIERS),
-      });
-    }
-
-    const current = await getCustomerPoints(customerId);
-
-    if (current.balance < tier.points) {
-      return res.status(400).json({
-        error: 'Not enough PLUR Points',
-        currentBalance: current.balance,
-        requiredPoints: tier.points,
-      });
-    }
-
-    const newBalance = current.balance - tier.points;
-    const newEarned = current.earned;
-    const newRedeemed = current.redeemed + tier.points;
-    const newTier = getTierName(newBalance);
-
-    const creditTx = await creditStoreCreditToCustomer(customerId, tier.credit, 'USD');
-    await setCustomerPoints(customerId, newBalance, newEarned, newRedeemed, newTier);
-
-    return res.status(200).json({
-      ok: true,
-      customerId,
-      customerName: current.name,
-      reward: tier,
-      oldBalance: current.balance,
-      newBalance,
-      oldRedeemed: current.redeemed,
-      newRedeemed,
-      newTier,
-      storeCreditTransaction: creditTx,
-    });
+    const result = await redeemForCustomer(customerId, reward);
+    return res.status(result.status).json(result.body);
   } catch (error) {
     console.error('redeem-test error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// real storefront proxy route
+app.post('/proxy/redeem', async (req, res) => {
+  try {
+    const signatureOk = verifyAppProxySignature(req.query);
+    const freshEnough = isFreshProxyRequest(req.query.timestamp);
+    const proxyShop = String(req.query.shop || '');
+
+    if (!signatureOk) {
+      return res.status(401).json({ error: 'Invalid proxy signature' });
+    }
+
+    if (!freshEnough) {
+      return res.status(401).json({ error: 'Expired proxy request' });
+    }
+
+    if (proxyShop !== SHOPIFY_STORE_DOMAIN) {
+      return res.status(401).json({ error: 'Shop mismatch' });
+    }
+
+    const loggedInCustomerId = String(req.query.logged_in_customer_id || '');
+    if (!loggedInCustomerId) {
+      return res.status(401).json({ error: 'You must be signed in to redeem points' });
+    }
+
+    const reward = req.body.reward || req.query.reward;
+    if (!reward) {
+      return res.status(400).json({ error: 'Missing reward' });
+    }
+
+    const customerGid = `gid://shopify/Customer/${loggedInCustomerId}`;
+    const result = await redeemForCustomer(customerGid, reward);
+
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error('proxy redeem error:', error);
     return res.status(500).json({ error: error.message });
   }
 });
