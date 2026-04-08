@@ -12,6 +12,7 @@ const {
   SHOPIFY_WEBHOOK_SECRET,
 } = process.env;
 
+// Shopify webhook route needs raw body for HMAC verification
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
 app.use(express.json());
 
@@ -122,14 +123,16 @@ async function getCustomerPoints(customerGid) {
     query GetCustomerPoints($id: ID!) {
       customer(id: $id) {
         id
-        metafields(identifiers: [
-          { namespace: "custom", key: "plur_points_balance" },
-          { namespace: "custom", key: "plur_points_earned" },
-          { namespace: "custom", key: "plur_points_redeemed" },
-          { namespace: "custom", key: "plur_tier" }
-        ]) {
-          namespace
-          key
+        plurPointsBalance: metafield(namespace: "custom", key: "plur_points_balance") {
+          value
+        }
+        plurPointsEarned: metafield(namespace: "custom", key: "plur_points_earned") {
+          value
+        }
+        plurPointsRedeemed: metafield(namespace: "custom", key: "plur_points_redeemed") {
+          value
+        }
+        plurTier: metafield(namespace: "custom", key: "plur_tier") {
           value
         }
       }
@@ -143,17 +146,11 @@ async function getCustomerPoints(customerGid) {
     throw new Error(`Customer not found: ${customerGid}`);
   }
 
-  const metafieldMap = {};
-  for (const mf of customer.metafields || []) {
-    if (!mf) continue;
-    metafieldMap[`${mf.namespace}.${mf.key}`] = mf.value;
-  }
-
   return {
-    balance: floorToInt(metafieldMap['custom.plur_points_balance']),
-    earned: floorToInt(metafieldMap['custom.plur_points_earned']),
-    redeemed: floorToInt(metafieldMap['custom.plur_points_redeemed']),
-    tier: metafieldMap['custom.plur_tier'] || 'Rookie Raver',
+    balance: floorToInt(customer.plurPointsBalance?.value),
+    earned: floorToInt(customer.plurPointsEarned?.value),
+    redeemed: floorToInt(customer.plurPointsRedeemed?.value),
+    tier: customer.plurTier?.value || 'Rookie Raver',
   };
 }
 
