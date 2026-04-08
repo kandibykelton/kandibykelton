@@ -10,9 +10,9 @@ const {
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_API_VERSION = '2026-04',
   SHOPIFY_WEBHOOK_SECRET,
+  REDEEM_ADMIN_KEY,
 } = process.env;
 
-// Raw body for Shopify webhook HMAC verification
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
 app.use('/webhooks/refunds-create', express.raw({ type: '*/*' }));
 app.use(express.json());
@@ -20,6 +20,13 @@ app.use(express.json());
 let tokenCache = {
   accessToken: null,
   expiresAt: 0,
+};
+
+const REWARD_TIERS = {
+  '100': { points: 100, credit: '5.00', label: '$5 off' },
+  '250': { points: 250, credit: '15.00', label: '$15 off' },
+  '500': { points: 500, credit: '30.00', label: '$30 off' },
+  '1000': { points: 1000, credit: '75.00', label: '$75 off' },
 };
 
 function floorToInt(value) {
@@ -128,6 +135,7 @@ async function getCustomerPoints(customerGid) {
     query GetCustomerPoints($id: ID!) {
       customer(id: $id) {
         id
+        displayName
         plurPointsBalance: metafield(namespace: "custom", key: "plur_points_balance") {
           value
         }
@@ -152,6 +160,8 @@ async function getCustomerPoints(customerGid) {
   }
 
   return {
+    id: customer.id,
+    name: customer.displayName,
     balance: floorToInt(customer.plurPointsBalance?.value),
     earned: floorToInt(customer.plurPointsEarned?.value),
     redeemed: floorToInt(customer.plurPointsRedeemed?.value),
@@ -221,13 +231,56 @@ async function setCustomerPoints(customerGid, balance, earned, redeemed, tier) {
   return result.data.metafieldsSet.metafields;
 }
 
+async function creditStoreCreditToCustomer(customerGid, amount, currencyCode = 'USD') {
+  const mutation = `
+    mutation CreditStoreCredit($id: ID!, $creditInput: StoreCreditAccountCreditInput!) {
+      storeCreditAccountCredit(id: $id, creditInput: $creditInput) {
+        storeCreditAccountTransaction {
+          amount {
+            amount
+            currencyCode
+          }
+          account {
+            id
+            balance {
+              amount
+              currencyCode
+            }
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    id: customerGid,
+    creditInput: {
+      creditAmount: {
+        amount: String(amount),
+        currencyCode,
+      },
+    },
+  };
+
+  const result = await adminGraphQL(mutation, variables);
+  const userErrors = result.data.storeCreditAccountCredit.userErrors || [];
+
+  if (userErrors.length) {
+    throw new Error(`storeCreditAccountCredit userErrors: ${JSON.stringify(userErrors)}`);
+  }
+
+  return result.data.storeCreditAccountCredit.storeCreditAccountTransaction;
+}
+
 function getRefundAmount(refund) {
-  // Prefer total refunded set if present
   if (refund.totalRefundedSet?.shopMoney?.amount != null) {
     return Number(refund.totalRefundedSet.shopMoney.amount || 0);
   }
 
-  // Admin webhook payload often includes transactions and refund_line_items
   let total = 0;
 
   if (Array.isArray(refund.transactions)) {
@@ -272,6 +325,62 @@ app.get('/token-test', async (req, res) => {
   } catch (error) {
     console.error('token-test error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/redeem-test', async (req, res) => {
+  try {
+    const { key, customerId, reward } = req.query;
+
+    if (!REDEEM_ADMIN_KEY || key !== REDEEM_ADMIN_KEY) {
+      return res.status(401).json({ error: 'Invalid redeem key' });
+    }
+
+    if (!customerId) {
+      return res.status(400).json({ error: 'Missing customerId' });
+    }
+
+    const tier = REWARD_TIERS[String(reward)];
+    if (!tier) {
+      return res.status(400).json({
+        error: 'Invalid reward',
+        validRewards: Object.keys(REWARD_TIERS),
+      });
+    }
+
+    const current = await getCustomerPoints(customerId);
+
+    if (current.balance < tier.points) {
+      return res.status(400).json({
+        error: 'Not enough PLUR Points',
+        currentBalance: current.balance,
+        requiredPoints: tier.points,
+      });
+    }
+
+    const newBalance = current.balance - tier.points;
+    const newEarned = current.earned;
+    const newRedeemed = current.redeemed + tier.points;
+    const newTier = getTierName(newBalance);
+
+    const creditTx = await creditStoreCreditToCustomer(customerId, tier.credit, 'USD');
+    await setCustomerPoints(customerId, newBalance, newEarned, newRedeemed, newTier);
+
+    return res.status(200).json({
+      ok: true,
+      customerId,
+      customerName: current.name,
+      reward: tier,
+      oldBalance: current.balance,
+      newBalance,
+      oldRedeemed: current.redeemed,
+      newRedeemed,
+      newTier,
+      storeCreditTransaction: creditTx,
+    });
+  } catch (error) {
+    console.error('redeem-test error:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -371,8 +480,6 @@ app.post('/webhooks/refunds-create', async (req, res) => {
     console.log('Refund ID:', refund.id);
     console.log('Order ID:', refund.order_id);
 
-    // Admin webhook payloads typically include order_id, but not always customer.
-    // So fetch order customer from Shopify if needed.
     let customerGid = refund.order?.customer?.admin_graphql_api_id || null;
 
     if (!customerGid && refund.order_id) {
@@ -405,7 +512,7 @@ app.post('/webhooks/refunds-create', async (req, res) => {
     const pointsToDeduct = floorToInt(refundAmount * deductRate);
 
     const newBalance = clampMinZero(current.balance - pointsToDeduct);
-    const newEarned = current.earned; // lifetime earned stays historical
+    const newEarned = current.earned;
     const newRedeemed = current.redeemed;
     const newTier = getTierName(newBalance);
 
