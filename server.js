@@ -12,8 +12,9 @@ const {
   SHOPIFY_WEBHOOK_SECRET,
 } = process.env;
 
-// Shopify webhook route needs raw body for HMAC verification
+// Raw body for Shopify webhook HMAC verification
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
+app.use('/webhooks/refunds-create', express.raw({ type: '*/*' }));
 app.use(express.json());
 
 let tokenCache = {
@@ -23,6 +24,10 @@ let tokenCache = {
 
 function floorToInt(value) {
   return Math.floor(Number(value) || 0);
+}
+
+function clampMinZero(value) {
+  return Math.max(0, floorToInt(value));
 }
 
 function getTierName(pointsBalance) {
@@ -216,6 +221,35 @@ async function setCustomerPoints(customerGid, balance, earned, redeemed, tier) {
   return result.data.metafieldsSet.metafields;
 }
 
+function getRefundAmount(refund) {
+  // Prefer total refunded set if present
+  if (refund.totalRefundedSet?.shopMoney?.amount != null) {
+    return Number(refund.totalRefundedSet.shopMoney.amount || 0);
+  }
+
+  // Admin webhook payload often includes transactions and refund_line_items
+  let total = 0;
+
+  if (Array.isArray(refund.transactions)) {
+    for (const tx of refund.transactions) {
+      const amount = Number(tx.amount || 0);
+      if (amount > 0) total += amount;
+    }
+  }
+
+  if (total > 0) return total;
+
+  if (Array.isArray(refund.refund_line_items)) {
+    for (const item of refund.refund_line_items) {
+      const subtotal = Number(item.subtotal || 0);
+      const tax = Number(item.total_tax || 0);
+      total += subtotal + tax;
+    }
+  }
+
+  return total;
+}
+
 app.get('/health', (req, res) => {
   res.status(200).send('ok');
 });
@@ -283,13 +317,7 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     const newRedeemed = current.redeemed;
     const newTier = getTierName(newBalance);
 
-    await setCustomerPoints(
-      customerGid,
-      newBalance,
-      newEarned,
-      newRedeemed,
-      newTier
-    );
+    await setCustomerPoints(customerGid, newBalance, newEarned, newRedeemed, newTier);
 
     console.log('Points updated successfully');
     console.log({
@@ -315,6 +343,98 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     });
   } catch (error) {
     console.error('orders/paid webhook error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/webhooks/refunds-create', async (req, res) => {
+  console.log('--- WEBHOOK HIT: /webhooks/refunds-create ---');
+  console.log('Topic:', req.get('X-Shopify-Topic'));
+  console.log('Shop:', req.get('X-Shopify-Shop-Domain'));
+
+  try {
+    const valid = verifyShopifyWebhook(req);
+    console.log('HMAC valid:', valid);
+
+    if (!valid) {
+      console.log('Invalid webhook signature');
+      return res.status(401).send('Invalid webhook signature');
+    }
+
+    const topic = req.get('X-Shopify-Topic');
+    if (topic !== 'refunds/create') {
+      console.log('Unexpected topic:', topic);
+      return res.status(400).send(`Unexpected topic: ${topic}`);
+    }
+
+    const refund = JSON.parse(req.body.toString('utf8'));
+    console.log('Refund ID:', refund.id);
+    console.log('Order ID:', refund.order_id);
+
+    // Admin webhook payloads typically include order_id, but not always customer.
+    // So fetch order customer from Shopify if needed.
+    let customerGid = refund.order?.customer?.admin_graphql_api_id || null;
+
+    if (!customerGid && refund.order_id) {
+      const orderLookup = await adminGraphQL(
+        `
+        query GetOrderCustomer($id: ID!) {
+          order(id: $id) {
+            id
+            customer {
+              id
+            }
+          }
+        }
+        `,
+        { id: `gid://shopify/Order/${refund.order_id}` }
+      );
+
+      customerGid = orderLookup.data.order?.customer?.id || null;
+    }
+
+    if (!customerGid) {
+      console.log('No customer attached to refunded order');
+      return res.status(200).send('No customer attached to refunded order');
+    }
+
+    const current = await getCustomerPoints(customerGid);
+
+    const refundAmount = Number(getRefundAmount(refund) || 0);
+    const deductRate = getEarnRate(current.balance);
+    const pointsToDeduct = floorToInt(refundAmount * deductRate);
+
+    const newBalance = clampMinZero(current.balance - pointsToDeduct);
+    const newEarned = current.earned; // lifetime earned stays historical
+    const newRedeemed = current.redeemed;
+    const newTier = getTierName(newBalance);
+
+    await setCustomerPoints(customerGid, newBalance, newEarned, newRedeemed, newTier);
+
+    console.log('Refund points deducted successfully');
+    console.log({
+      customerId: customerGid,
+      refundAmount,
+      deductRate,
+      pointsToDeduct,
+      oldBalance: current.balance,
+      newBalance,
+      newTier,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      customerId: customerGid,
+      refundId: refund.admin_graphql_api_id || refund.id,
+      refundAmount,
+      deductRate,
+      pointsToDeduct,
+      oldBalance: current.balance,
+      newBalance,
+      newTier,
+    });
+  } catch (error) {
+    console.error('refunds/create webhook error:', error);
     return res.status(500).json({ error: error.message });
   }
 });
