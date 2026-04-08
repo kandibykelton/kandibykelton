@@ -11,6 +11,7 @@ const {
   SHOPIFY_API_VERSION = '2026-04',
   SHOPIFY_WEBHOOK_SECRET,
   REDEEM_ADMIN_KEY,
+  APP_PROXY_ALLOWED_SHOPS,
 } = process.env;
 
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
@@ -36,6 +37,30 @@ function floorToInt(value) {
 
 function clampMinZero(value) {
   return Math.max(0, floorToInt(value));
+}
+
+function normalizeShopDomain(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '');
+}
+
+function getAllowedProxyShops() {
+  const shops = new Set();
+
+  const mainShop = normalizeShopDomain(SHOPIFY_STORE_DOMAIN);
+  if (mainShop) shops.add(mainShop);
+
+  const extra = String(APP_PROXY_ALLOWED_SHOPS || '')
+    .split(',')
+    .map(normalizeShopDomain)
+    .filter(Boolean);
+
+  for (const shop of extra) shops.add(shop);
+
+  return Array.from(shops);
 }
 
 function getTierName(pointsBalance) {
@@ -70,31 +95,29 @@ function verifyShopifyWebhook(req) {
 
 function verifyAppProxySignature(query) {
   const providedSignature = query.signature;
-  if (!providedSignature) return false;
+  if (!providedSignature || !SHOPIFY_CLIENT_SECRET) return false;
 
   const cloned = { ...query };
   delete cloned.signature;
 
-  const sorted = Object.keys(cloned)
+  const message = Object.keys(cloned)
     .sort()
     .map((key) => {
       const value = cloned[key];
-      if (Array.isArray(value)) {
-        return `${key}=${value.join(',')}`;
-      }
+      if (Array.isArray(value)) return `${key}=${value.join(',')}`;
       return `${key}=${value ?? ''}`;
     })
     .join('');
 
   const digest = crypto
     .createHmac('sha256', SHOPIFY_CLIENT_SECRET)
-    .update(sorted)
+    .update(message)
     .digest('hex');
 
   try {
     return crypto.timingSafeEqual(
       Buffer.from(digest),
-      Buffer.from(providedSignature)
+      Buffer.from(String(providedSignature))
     );
   } catch {
     return false;
@@ -115,7 +138,7 @@ async function getAdminAccessToken() {
     return tokenCache.accessToken;
   }
 
-  const response = await fetch(`https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`, {
+  const response = await fetch(`https://${normalizeShopDomain(SHOPIFY_STORE_DOMAIN)}/admin/oauth/access_token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -144,7 +167,7 @@ async function adminGraphQL(query, variables = {}) {
   const token = await getAdminAccessToken();
 
   const response = await fetch(
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    `https://${normalizeShopDomain(SHOPIFY_STORE_DOMAIN)}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
     {
       method: 'POST',
       headers: {
@@ -416,7 +439,7 @@ app.get('/token-test', async (req, res) => {
   }
 });
 
-// keep for backup testing only
+// backup testing route only
 app.get('/redeem-test', async (req, res) => {
   try {
     const { key, customerId, reward } = req.query;
@@ -442,7 +465,16 @@ app.post('/proxy/redeem', async (req, res) => {
   try {
     const signatureOk = verifyAppProxySignature(req.query);
     const freshEnough = isFreshProxyRequest(req.query.timestamp);
-    const proxyShop = String(req.query.shop || '');
+
+    const proxyShop = normalizeShopDomain(req.query.shop);
+    const allowedShops = getAllowedProxyShops();
+
+    console.log('--- PROXY HIT: /proxy/redeem ---');
+    console.log('Proxy shop:', proxyShop);
+    console.log('Allowed shops:', allowedShops);
+    console.log('Signature valid:', signatureOk);
+    console.log('Fresh timestamp:', freshEnough);
+    console.log('Logged in customer id:', req.query.logged_in_customer_id || '');
 
     if (!signatureOk) {
       return res.status(401).json({ error: 'Invalid proxy signature' });
@@ -452,11 +484,15 @@ app.post('/proxy/redeem', async (req, res) => {
       return res.status(401).json({ error: 'Expired proxy request' });
     }
 
-    if (proxyShop !== SHOPIFY_STORE_DOMAIN) {
-      return res.status(401).json({ error: 'Shop mismatch' });
+    if (!allowedShops.includes(proxyShop)) {
+      return res.status(401).json({
+        error: 'Shop mismatch',
+        proxyShop,
+        allowedShops,
+      });
     }
 
-    const loggedInCustomerId = String(req.query.logged_in_customer_id || '');
+    const loggedInCustomerId = String(req.query.logged_in_customer_id || '').trim();
     if (!loggedInCustomerId) {
       return res.status(401).json({ error: 'You must be signed in to redeem points' });
     }
