@@ -12,10 +12,6 @@ const {
   SHOPIFY_WEBHOOK_SECRET,
 } = process.env;
 
-/*
-  Shopify webhook route needs raw body for HMAC verification.
-  All other routes can use JSON parsing normally.
-*/
 app.use('/webhooks/orders-paid', express.raw({ type: '*/*' }));
 app.use(express.json());
 
@@ -64,7 +60,7 @@ function verifyShopifyWebhook(req) {
 async function getAdminAccessToken() {
   const now = Date.now();
 
-  if (tokenCache.accessToken && now < tokenCache.expiresAt - 60_000) {
+  if (tokenCache.accessToken && now < tokenCache.expiresAt - 60000) {
     return tokenCache.accessToken;
   }
 
@@ -243,29 +239,42 @@ app.get('/token-test', async (req, res) => {
 
     res.json(result);
   } catch (error) {
+    console.error('token-test error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/webhooks/orders-paid', async (req, res) => {
+  console.log('--- WEBHOOK HIT: /webhooks/orders-paid ---');
+  console.log('Topic:', req.get('X-Shopify-Topic'));
+  console.log('Shop:', req.get('X-Shopify-Shop-Domain'));
+
   try {
-    if (!verifyShopifyWebhook(req)) {
+    const valid = verifyShopifyWebhook(req);
+    console.log('HMAC valid:', valid);
+
+    if (!valid) {
+      console.log('Invalid webhook signature');
       return res.status(401).send('Invalid webhook signature');
     }
 
     const topic = req.get('X-Shopify-Topic');
     if (topic !== 'orders/paid') {
+      console.log('Unexpected topic:', topic);
       return res.status(400).send(`Unexpected topic: ${topic}`);
     }
 
     const order = JSON.parse(req.body.toString('utf8'));
+    console.log('Order ID:', order.id);
+    console.log('Financial status:', order.financial_status);
+    console.log('Customer exists:', !!order.customer);
 
     if (!order.customer || !order.customer.admin_graphql_api_id) {
+      console.log('No customer attached to order');
       return res.status(200).send('No customer attached to order');
     }
 
     const customerGid = order.customer.admin_graphql_api_id;
-
     const current = await getCustomerPoints(customerGid);
 
     const orderTotal = Number(order.current_total_price || order.total_price || 0);
@@ -284,6 +293,17 @@ app.post('/webhooks/orders-paid', async (req, res) => {
       newRedeemed,
       newTier
     );
+
+    console.log('Points updated successfully');
+    console.log({
+      customerId: customerGid,
+      orderTotal,
+      earnRate,
+      earnedThisOrder,
+      oldBalance: current.balance,
+      newBalance,
+      newTier,
+    });
 
     return res.status(200).json({
       ok: true,
